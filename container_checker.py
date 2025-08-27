@@ -10,7 +10,7 @@ import glob
 # from various registries, including Docker Hub, GitHub Container Registry,
 # and Codeberg Container Registry.
 
-TARGET_DIRECTORY = '.'
+TARGET_DIRECTORY = './configs'
 
 def get_docker_hub_auth_token():
     """Fetches a Docker Hub authentication token."""
