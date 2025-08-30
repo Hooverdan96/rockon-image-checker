@@ -1,285 +1,304 @@
-import argparse
+# A program to extract image and tag information from JSON configuration files,
+# including checks for image availability on Docker Hub.
+
 import os
-import requests
 import json
-from datetime import datetime
-from urllib.parse import urlparse
-import glob
+import requests
+import re
+from tabulate import tabulate
 
-# This script checks the availability and last published date of container images
-# from various registries, including Docker Hub, GitHub Container Registry,
-# and Codeberg Container Registry.
-
+# The default directory to search for JSON files.
 TARGET_DIRECTORY = './configs'
+# The file to exclude from processing.
+EXCLUSION_FILE = 'root.json'
 
-def get_docker_hub_auth_token():
-    """Fetches a Docker Hub authentication token."""
-    url = "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/ubuntu:pull"
+def parse_image(image_str, tag_from_json=None):
+    """
+    Parses an image string to extract the image name and tag (container version).
+    Assumes "latest" if no tag is specified.
+
+    Args:
+        image_str (str): The full image string, e.g., 'ubuntu:20.04' or 'myrepo/myimage' or `ghcr.io/myrepo/myimage'.
+
+    Returns:
+        tuple: A tuple containing registry (str), owner (str), container (str), tag (str).
+    """
+
+    # Determine version 'tag' in case it is part of the image, if none then default to 'latest'
+    if ':' in image_str:
+        image_name, tag = image_str.rsplit(':', 1)
+    elif tag_from_json == '':
+        image_name = image_str
+        tag = tag_from_json
+    else:
+        image_name = image_str
+        tag = 'latest'
+
+    # Split remaining image_name into registry, owner, container for most flexibility across registry APIs
+    parts = image_name.split("/", 1)
+    if len(parts) == 2 and ("." in parts[0]):
+        registry = parts[0]
+        remainder = parts[1]
+    else:
+        # Default to Docker Hub
+        registry = "docker.io"
+        remainder = image_name
+
+    # Docker Hub official images do not have a user/repo prefix
+    if '/' not in image_name:
+        container = remainder
+        owner = 'library'
+        return registry, owner, container,tag
+    else:
+        # Split image into owner & container
+        parts = remainder.split("/", 1)
+        owner = parts[0]
+        container = parts[1]
+        return registry, owner, container, tag
+
+def check_docker_hub_image(owner, image_name, tag, print_payload=False):
+    """
+    Checks Docker Hub for image availability and last published date.
+
+    Args:
+        owner (str): Typically, the repository owner
+        image_name (str): The name of the Docker image (e.g., 'nginx', 'myimage').
+        tag (str): The specific tag (version) to check.
+        print_payload (bool): If True, prints the request headers and payload.
+
+    Returns:
+        dict: A dictionary with 'available' (bool or str) and 'last_published' (str).
+    """
+    # Docker Hub official images do not have a user/repo prefix
+    # if '/' not in image_name:
+    #     image_name = f"library/{image_name}"
+
+    api_url = f"https://hub.docker.com/v2/repositories/{owner.lower()}/{image_name.lower()}/tags/{tag}"
+
+    if print_payload:
+        print(f"Docker Hub API URL: {api_url}")
+
     try:
-        response = requests.get(url, timeout=5)
-        response.raise_for_status()  # Raise an exception for bad status codes
-        return response.json()['token']
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching Docker Hub token: {e}")
-        return None
+        response = requests.get(api_url, timeout=5)
+        response.raise_for_status()
 
-def check_image_availability(image_name, github_token=None, codeberg_token=None, print_payload=False):
-    """
-    Checks the availability and last published date of a container image.
-    Supports Docker Hub, GHCR, and Codeberg.
-    """
-    availability_status = "Not Found"
-    last_published_date = "N/A"
-    
-    # Pre-parse the image name to determine the registry
-    registry = "docker.io"
-    path = image_name
-    
-    if '/' in image_name:
-        parts = image_name.split('/')
-        # Check if the first part is a known registry
-        if parts[0].endswith('.io') or parts[0].endswith('.org'):
-            registry = parts[0]
-            path = '/'.join(parts[1:])
+        data = response.json()
         
-    print(f"Checking {image_name}...")
-
-    try:
-        # --- Docker Hub Logic ---
-        if registry == "docker.io":
-            # For official images like `python`, use library/python
-            if '/' not in image_name:
-                path = f"library/{path}"
-            
-            token = get_docker_hub_auth_token()
-            if not token:
-                print("Skipping Docker Hub check due to failed authentication.")
-                return image_name, "Error", "N/A"
-            
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.docker.distribution.manifest.v2+json"
-            }
-            url = f"https://registry-1.docker.io/v2/{path}/manifests/latest"
-            
-            response = requests.head(url, headers=headers, timeout=10)
-            if print_payload:
-                print(f"API Payload (HEAD): {response.headers}")
-
-            if response.status_code == 200:
-                availability_status = "Available"
-                if "Docker-Content-Digest" in response.headers:
-                    # Get image digest to fetch manifest
-                    digest = response.headers["Docker-Content-Digest"]
-                    manifest_url = f"https://registry-1.docker.io/v2/{path}/manifests/{digest}"
-                    manifest_response = requests.get(manifest_url, headers=headers, timeout=10)
-                    if print_payload:
-                        print(f"API Payload (GET): {manifest_response.json()}")
-                    
-                    if manifest_response.status_code == 200:
-                        manifest_data = manifest_response.json()
-                        if 'history' in manifest_data and manifest_data['history']:
-                            last_layer = json.loads(manifest_data['history'][0]['v1Compatibility'])
-                            created_str = last_layer.get('created', 'N/A')
-                            if created_str != 'N/A':
-                                created_date = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
-                                last_published_date = created_date.strftime("%Y-%m-%d")
-
-        # --- GitHub Container Registry (GHCR) Logic ---
-        elif registry == "ghcr.io":
-            if not github_token:
-                print("Skipping GHCR check: No GitHub token provided.")
-                availability_status = "Auth Required"
-            else:
-                url = f"https://ghcr.io/v2/{path}/manifests/latest"
-                headers = {
-                    "Authorization": f"Bearer {github_token}",
-                    "Accept": "application/vnd.docker.distribution.manifest.v2+json"
-                }
-                response = requests.head(url, headers=headers, timeout=10)
-                if print_payload:
-                    print(f"API Payload (HEAD): {response.headers}")
-                
-                if response.status_code == 200:
-                    availability_status = "Available"
-                # Last Published Date is complex to get directly
-                last_published_date = "N/A (Complex API)"
-
-        # --- Codeberg Container Registry Logic ---
-        elif registry == "codeberg.org":
-            if not codeberg_token:
-                print("Skipping Codeberg check: No JWT token provided.")
-                availability_status = "Auth Required"
-            else:
-                url = f"https://codeberg.org/v2/{path}/manifests/latest"
-                headers = {
-                    "Authorization": f"Bearer {codeberg_token}",
-                    "Accept": "application/vnd.docker.distribution.manifest.v2+json"
-                }
-                response = requests.head(url, headers=headers, timeout=10)
-                if print_payload:
-                    print(f"API Payload (HEAD): {response.headers}")
-                
-                if response.status_code == 200:
-                    availability_status = "Available"
-                # Last Published Date is complex to get directly
-                last_published_date = "N/A (Complex API)"
-
-        # --- Unknown Registry Logic ---
+        # Check if the API response contains a 'last_updated' field, which
+        # indicates the specific tag exists.
+        if 'last_updated' in data:
+            return {"available": True, "last_published": data.get('last_updated')}
         else:
-            availability_status = "Unknown Registry"
-            last_published_date = "N/A"
-
-    except requests.exceptions.RequestException as e:
-        availability_status = f"Error: {e}"
-
-    return image_name, availability_status, last_published_date
-
-def get_images_from_json():
-    """Parses JSON files in the target directory to extract unique image:tag combinations."""
-    images = set()
-    print(f"Scanning JSON files in {TARGET_DIRECTORY}...")
-    json_files = glob.glob(os.path.join(TARGET_DIRECTORY, '*.json'))
-    
-    for filename in json_files:
-        try:
-            with open(filename, 'r') as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    # Recursively search for 'image' and 'tag' keys
-                    def find_images(obj):
-                        if isinstance(obj, dict):
-                            if 'image' in obj and 'tag' in obj:
-                                images.add(f"{obj['image']}:{obj['tag']}")
-                            for key, value in obj.items():
-                                find_images(value)
-                        elif isinstance(obj, list):
-                            for item in obj:
-                                find_images(item)
-                    find_images(data)
-        except (IOError, json.JSONDecodeError) as e:
-            print(f"Warning: Could not read or parse {filename}. Error: {e}")
+            return {"available": False, "last_published": "N/A"}
             
-    if not images:
-        print("No image:tag combinations found in JSON files.")
+    except requests.exceptions.HTTPError as e:
+        # 404 Not Found means the image or tag does not exist
+        if e.response.status_code == 404:
+            return {"available": False, "last_published": "N/A"}
+        return {"available": "Error", "last_published": "N/A"}
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: Could not check Docker Hub for '{image_name}': {e}")
+        return {"available": "Unknown", "last_published": "N/A"}
+
+def check_ghcr_image(owner, image_name, tag, github_token=None, print_payload=False):
+    """
+    Checks GitHub Container Registry.
+    Args:
+        owner (str): Typically, the repository owner
+        image_name (str): The name of the Docker image (e.g., 'nginx', 'myimage').
+        tag (str): The specific tag (version) to check.
+        github_token(str): requires classic Personal Access Token, not base64 encoded.
+        print_payload (bool): If True, prints the request headers and payload.
+
+    Returns:
+        dict: A dictionary with 'available' (bool or str) and 'last_published' (str).
+
+    Requires a GitHub access token with 'read:packages' scope.
+    Caveat, it will not consider the version without more complications
+    so using github API and not OCI version.
+    """
+    
+    
+    api_url = f"https://api.github.com/users/{owner}/packages/container/{image_name}"
+    # future, if OCI API is ever more thoroughly implemented, switch over
+    # api_url = f"https://ghcr.io/v2/{path}/manifests/{tag}"
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github+json"
+    }
+    try:
+        response = requests.get(api_url, headers=headers, timeout=10)
+        data = response.json()
+
+        if print_payload:
+            print(f"API Payload (HEAD): {response.headers}")
+            print(f"Body: {response.json()}")
+            print (data)
+
+        if 'updated_at' in data:
+            return {"available": True, "last_published": data.get('updated_at')}
+        else:
+            return {"available": False, "last_published": "N/A"}
+
+    except requests.exceptions.HTTPError as e:
+        # 404 Not Found means the image or tag does not exist
+        if e.response.status_code == 404:
+            return {"available": False, "last_published": "N/A"}
+        return {"available": "Error", "last_published": "N/A"}
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: Could not check ghcr.io registry for '{image_name}': {e}")
+        return {"available": "Unknown", "last_published": "N/A"}
+
+    return {"available": "Not Implemented", "last_published": "N/A"}
+
+def check_codeberg_image(owner, image_name, tag, codeberg_token=None, print_payload=False):
+    """
+    Checks GitHub Container Registry.
+    Args:
+        owner (str): Typically, the repository owner
+        image_name (str): The name of the Docker image (e.g., 'nginx', 'myimage').
+        tag (str): The specific tag (version) to check.
+        codeberg_token(str): currently does not require a token, might in the future.
+        print_payload (bool): If True, prints the request headers and payload.
+
+    Returns:
+        dict: A dictionary with 'available' (bool or str) and 'last_published' (str).
+    
+    Codeberg's registry is based on Gitea's API.
+    """
+    
+    api_url = f"https://codeberg.org/api/v1/packages/{owner}/container/{image_name}/{tag}"
+    
+
+    headers = {
+        # "Authorization": f"Bearer {codeberg_token}",
+        "Accept": "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.github+json, application/json"
+    }
+    try:
+        response = requests.get(api_url, headers=headers, timeout=10)
+        data = response.json()
+
+        if print_payload:
+            print(f"API Payload (HEAD): {response.headers}")
+            print(f"Body: {data}")
+
+        if 'created_at' in data:
+            return {"available": True, "last_published": data.get('created_at')}
+        else:
+            return {"available": False, "last_published": "N/A"}
+
+    except requests.exceptions.HTTPError as e:
+        # 404 Not Found means the image or tag does not exist
+        if e.response.status_code == 404:
+            return {"available": False, "last_published": "N/A"}
+        return {"available": "Error", "last_published": "N/A"}
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: Could not check codeberg.org registry for '{image_name}': {e}")
+        return {"available": "Unknown", "last_published": "N/A"}
+
+        return {"available": "Not Implemented", "last_published": "N/A"}
+
+def check_image_repository(image_str, tag_from_json=None, github_token=None, codeberg_token=None, print_payload=False):
+    """
+    Determines the repository and checks image availability and last published date.
+    This function acts as a dispatcher based on the image name's prefix.
+    Args:
+        image_str (str): image string extracted from <image> in Rockon json file.
+        tag_from_json (str): if tag existed in json file it should be populated, otherwise optional.
+        github_token (str): Github PAT token, if any image is from the github container registry.
+        codeberg_token (str): Codeberg API token, currently not required to inspect containers on the registry.
+        print_payload (bool): If True, prints the request headers and payload.
+    """
+    registry, owner, image_name, tag_to_check = parse_image(image_str, tag_from_json)
+    # tag_to_check = tag_from_json if tag_from_json is not None else inferred_tag
+
+    # temporarily: github token is not encoded
+    # github_token = ''
+    # codeberg_token = ''   
+
+    if registry.startswith('ghcr.io'):
+        return check_ghcr_image(owner, image_name, tag_to_check, github_token, print_payload)
+    elif registry.startswith('codeberg.org'):
+        return check_codeberg_image(owner, image_name, tag_to_check, codeberg_token, print_payload)
+    # Insert conditions here for any other container registries. If API tokens are required, then assign interfaces
     else:
-        print("\nFound the following unique image:tag combinations:")
-        for img in sorted(list(images)):
-            print(f"- {img}")
-    
-    return list(images)
+        # Assume Docker Hub for all other image names, including those with a slash
+        return check_docker_hub_image(owner, image_name, tag_to_check, print_payload)
 
-def print_results(results, output_format):
-    """Prints the results in the specified format."""
-    if output_format == 'json':
-        output_data = [
-            {"image": r[0], "status": r[1], "last_published": r[2]}
-            for r in results
-        ]
-        print(json.dumps(output_data, indent=4))
-    
-    elif output_format == 'html':
-        html_content = """
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Container Image Availability Report</title>
-            <script src="https://cdn.tailwindcss.com"></script>
-            <style>
-                body {
-                    font-family: 'Inter', sans-serif;
-                }
-            </style>
-        </head>
-        <body class="bg-gray-100 p-8">
-            <div class="max-w-4xl mx-auto bg-white rounded-lg shadow-xl p-6">
-                <h1 class="text-3xl font-bold text-center mb-6 text-gray-800">Container Image Availability Report</h1>
-                <div class="overflow-x-auto rounded-lg">
-                    <table class="min-w-full bg-white border border-gray-200">
-                        <thead class="bg-blue-600 text-white">
-                            <tr>
-                                <th class="py-3 px-4 text-left font-semibold">Image</th>
-                                <th class="py-3 px-4 text-left font-semibold">Status</th>
-                                <th class="py-3 px-4 text-left font-semibold">Last Published</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-        """
-        for image, status, date in results:
-            status_class = "text-green-600 font-medium" if status == "Available" else "text-red-600 font-medium"
-            html_content += f"""
-                            <tr class="border-t border-gray-200 hover:bg-gray-50">
-                                <td class="py-3 px-4 text-gray-700 font-mono">{image}</td>
-                                <td class="py-3 px-4 {status_class}">{status}</td>
-                                <td class="py-3 px-4 text-gray-500">{date}</td>
-                            </tr>
-            """
-        html_content += """
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        print(html_content)
+def process_json_files(directory):
+    """
+    Reads JSON files from a specified directory, extracts image and tag
+    information, and returns the data as a list of dictionaries.
 
-    elif output_format == 'markdown':
-        print("| Image | Status | Last Published |")
-        print("|---|---|---|")
-        for image, status, date in results:
-            print(f"| {image} | {status} | {date} |")
-    
-    else:  # 'console' is the default
-        print("-" * 50)
-        print("Image Availability Report")
-        print("-" * 50)
-        print(f"{'Image':<40} | {'Status':<15} | {'Last Published'}")
-        print("-" * 50)
-        for image, status, date in results:
-            print(f"{image:<40} | {status:<15} | {date}")
-        print("-" * 50)
+    Args:
+        directory (str): The path to the directory containing the JSON files.
 
-def main():
-    """Main function to parse arguments and run the checks."""
-    parser = argparse.ArgumentParser(description="Check singlecontainer image availability.")
-    parser.add_argument("-i", "--image", type=str,
-                        help="Check a single image. Ignores JSON files.")
-    parser.add_argument("-g", "--github-token", type=str,
-                        help="GitHub Personal Access Token for ghcr.io authentication.")
-    parser.add_argument("-c", "--codeberg-token", type=str,
-                        help="Codeberg JWT token for codeberg.org authentication.")
-    parser.add_argument("-p", "--print-payload", action="store_true",
-                        help="Print the raw API payloads for debugging.")
-    parser.add_argument("-o", "--output-format", choices=['console', 'json', 'html', 'markdown'],
-                        default='console', help="Output format for the results.")
+    Returns:
+        list: A list of dictionaries, where each dictionary represents a row
+              in the final table.
+    """
+    extracted_data = []
 
-    args = parser.parse_args()
-    
-    # Use command-line argument if provided, otherwise check environment variables
-    github_token = args.github_token or os.environ.get("GITHUB_TOKEN")
-    codeberg_token = args.codeberg_token or os.environ.get("CODEBERG_TOKEN")
+    # Check if the target directory exists
+    if not os.path.isdir(directory):
+        print(f"Error: Directory '{directory}' not found.")
+        return extracted_data
 
-    images_to_check = []
-    if args.image:
-        image_to_process = args.image
-        if ':' not in image_to_process:
-            image_to_process += ':latest'
-        images_to_check.append(image_to_process)
-    else:
-        images_to_check = get_images_from_json()
+    # Iterate over all files in the directory
+    for filename in os.listdir(directory):
+        # Skip the exclusion file and files that are not JSON
+        if filename == EXCLUSION_FILE or not filename.endswith('.json'):
+            continue
 
-    if not images_to_check:
-        print("No images to check. Exiting.")
-        return
+        file_path = os.path.join(directory, filename)
+        
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
 
-    results = []
-    for image in images_to_check:
-        results.append(check_image_availability(image, github_token, codeberg_token, args.print_payload))
-    
-    print_results(results, args.output_format)
+                # The file identifier is the top-level key.
+                file_identifier = list(data.keys())[0]
+
+                # Access the containers dictionary
+                containers = data.get(file_identifier, {}).get('containers', {})
+
+                # Iterate through each container within the 'containers' key
+                for container_name, container_details in containers.items():
+                    image = container_details.get('image')
+                    tag = container_details.get('tag')
+
+                    # Only process if an image is found
+                    if image:
+                        # Use the dispatcher function to check the repository
+                        repo_info = check_image_repository(image, tag)
+                        
+                        # Set the tag for the output table, using 'latest' if none is found
+                        display_tag = tag if tag is not None else 'latest'
+
+                        extracted_data.append({
+                            "Rockon Name": file_identifier,
+                            "image": image,
+                            "tag": display_tag,
+                            "image:tag": f"{image}:{display_tag}",
+                            "Availability": repo_info.get("available"),
+                            "Last Published": repo_info.get("last_published")
+                        })
+
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON from file '{filename}': {e}")
+        except FileNotFoundError:
+            print(f"Error: File '{filename}' not found at '{file_path}'.")
+        except Exception as e:
+            print(f"An unexpected error occurred while processing '{filename}': {e}")
+
+    return extracted_data
 
 if __name__ == "__main__":
-    main()
+    # Process the files and get the data
+    data_to_display = process_json_files(TARGET_DIRECTORY)
+
+    # Print the data as a formatted table
+    if data_to_display:
+        print(tabulate(data_to_display, headers="keys", tablefmt="pipe"))
+    else:
+        print("No data extracted. Please check the directory and file contents.")
