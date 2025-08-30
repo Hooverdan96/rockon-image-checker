@@ -6,6 +6,8 @@ import json
 import requests
 import re
 from tabulate import tabulate
+import glob
+import argparse
 
 # The default directory to search for JSON files.
 TARGET_DIRECTORY = './configs'
@@ -217,6 +219,8 @@ def check_image_repository(image_str, tag_from_json=None, github_token=None, cod
     # codeberg_token = ''   
 
     if registry.startswith('ghcr.io'):
+        if github_token is None:
+            print("Warning: GitHub token not provided. Checks for ghcr.io images may be inaccurate.")
         return check_ghcr_image(owner, image_name, tag_to_check, github_token, print_payload)
     elif registry.startswith('codeberg.org'):
         return check_codeberg_image(owner, image_name, tag_to_check, codeberg_token, print_payload)
@@ -225,7 +229,7 @@ def check_image_repository(image_str, tag_from_json=None, github_token=None, cod
         # Assume Docker Hub for all other image names, including those with a slash
         return check_docker_hub_image(owner, image_name, tag_to_check, print_payload)
 
-def process_json_files(directory):
+def process_json_files(directory, github_token, codeberg_token, print_payload):
     """
     Reads JSON files from a specified directory, extracts image and tag
     information, and returns the data as a list of dictionaries.
@@ -270,13 +274,13 @@ def process_json_files(directory):
                     # Only process if an image is found
                     if image:
                         # Use the dispatcher function to check the repository
-                        repo_info = check_image_repository(image, tag)
+                        repo_info = check_image_repository(image, tag, github_token, codeberg_token, print_payload)
                         
                         # Set the tag for the output table, using 'latest' if none is found
                         display_tag = tag if tag is not None else 'latest'
 
                         extracted_data.append({
-                            "Rockon Name": file_identifier,
+                            "Rockon": file_identifier,
                             "image": image,
                             "tag": display_tag,
                             "image:tag": f"{image}:{display_tag}",
@@ -293,12 +297,183 @@ def process_json_files(directory):
 
     return extracted_data
 
-if __name__ == "__main__":
-    # Process the files and get the data
-    data_to_display = process_json_files(TARGET_DIRECTORY)
+def get_images_from_json(directory):
+    """
+    Reads JSON files to extract all unique image:tag combinations before network calls.
+    """
+    images = set()
 
-    # Print the data as a formatted table
-    if data_to_display:
-        print(tabulate(data_to_display, headers="keys", tablefmt="pipe"))
+    if not os.path.isdir(directory):
+        return images
+
+    for filename in os.listdir(directory):
+        if filename == EXCLUSION_FILE or not filename.endswith('.json'):
+            continue
+
+        file_path = os.path.join(directory, filename)
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+                
+                def find_images_recursive(obj):
+                    if isinstance(obj, dict):
+                        image = obj.get('image')
+                        tag = obj.get('tag')
+                        if image:
+                            display_tag = tag if tag is not None and tag != '' else 'latest'
+                            images.add(f"{image}:{display_tag}")
+                        for value in obj.values():
+                            find_images_recursive(value)
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            find_images_recursive(item)
+
+                find_images_recursive(data)
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            print(f"Warning: Could not read or parse {filename}. Error: {e}")
+
+    return sorted(list(images))
+
+def print_results(results, output_format):
+    """Prints the results in the specified format."""
+    if output_format == 'json':
+        output_data = [
+            {"rockon": r['Rockon'], "image": r['image:tag'], "version": r['tag'], "status": r['Availability'], "last_published": r['Last Published']}
+            for r in results
+        ]
+        print(json.dumps(output_data, indent=4))
+    
+    elif output_format == 'html':
+        html_content = """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Container Image Availability Report</title>
+            <script src="https://cdn.tailwindcss.com"></script>
+            <style>
+                body {
+                    font-family: 'Inter', sans-serif;
+                }
+            </style>
+        </head>
+        <body class="bg-gray-100 p-8">
+            <div class="max-w-4xl mx-auto bg-white rounded-lg shadow-xl p-6">
+                <h1 class="text-3xl font-bold text-center mb-6 text-gray-800">Container Image Availability Report</h1>
+                <div class="overflow-x-auto rounded-lg">
+                    <table class="min-w-full bg-white border border-gray-200">
+                        <thead class="bg-blue-600 text-white">
+                            <tr>
+                                <th class="py-3 px-4 text-left font-semibold">Rockon</th>
+                                <th class="py-3 px-4 text-left font-semibold">Image</th>
+                                <th class="py-3 px-4 text-left font-semibold">Version</th>
+                                <th class="py-3 px-4 text-left font-semibold">Status</th>
+                                <th class="py-3 px-4 text-left font-semibold">Last Published</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+        """
+        for r in results:
+            image_name = r['image:tag']
+            status = r['Availability']
+            date = r['Last Published']
+            rockon_name = r['Rockon']
+            version = r['tag']
+            status_class = "text-green-600 font-medium" if status == "Available" else "text-red-600 font-medium"
+            html_content += f"""
+                            <tr class="border-t border-gray-200 hover:bg-gray-50">
+                                <td class="py-3 px-4 text-gray-700">{rockon_name}</td>
+                                <td class="py-3 px-4 text-gray-700 font-mono">{image_name}</td>
+                                <td class="py-3 px-4 text-gray-700">{version}</td>
+                                <td class="py-3 px-4 {status_class}">{status}</td>
+                                <td class="py-3 px-4 text-gray-500">{date}</td>
+                            </tr>
+            """
+        html_content += """
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        print(html_content)
+
+    elif output_format == 'markdown':
+        print("| Rockon | Image | Version | Status | Last Published |")
+        print("|---|---|---|---|---|")
+        for r in results:
+            print(f"| {r['Rockon']} | {r['image:tag']} | {r['tag']} | {r['Availability']} | {r['Last Published']} |")
+
+    else:  # 'console' is the default
+        if results:
+            # Reformat results for tabulate
+            formatted_results = [
+                (r['Rockon'], r['image:tag'], r['tag'], r['Availability'], r['Last Published']) for r in results
+            ]
+            print(tabulate(formatted_results, headers=["Rockon", "Image", "Version", "Status", "Last Published"], tablefmt="pipe"))
+        else:
+            print("No data extracted. Please check the directory and file contents.")
+
+
+def main():
+    """Main function to parse arguments and run the checks."""
+    parser = argparse.ArgumentParser(description="Check container image availability.")
+    parser.add_argument("-i", "--image", type=str,
+                        help="Check a single image. Ignores JSON files.")
+    parser.add_argument("-g", "--github-token", type=str,
+                        help="GitHub Personal Access Token for ghcr.io authentication.")
+    parser.add_argument("-c", "--codeberg-token", type=str,
+                        help="Codeberg JWT token for codeberg.org authentication.")
+    parser.add_argument("-p", "--print-payload", action="store_true",
+                        help="Print the raw API payloads for debugging.")
+    parser.add_argument("-o", "--output-format", choices=['console', 'json', 'html', 'markdown'],
+                        default='console', help="Output format for the results.")
+    parser.add_argument("-d", "--directory", type=str, default=TARGET_DIRECTORY,
+                        help=f"Specify the directory to scan for JSON files. Defaults to '{TARGET_DIRECTORY}'.")
+
+    args = parser.parse_args()
+
+    # Use command-line argument if provided, otherwise check environment variables
+    github_token = args.github_token or os.environ.get("GITHUB_TOKEN")
+    codeberg_token = args.codeberg_token or os.environ.get("CODEBERG_TOKEN")
+    json_directory = args.directory
+
+    results = []
+
+    if args.image:
+        print(f"Checking a single image: {args.image}")
+        # Parse the single image and process it
+        registry, owner, image_name, tag = parse_image(args.image)
+        repo_info = check_image_repository(args.image, tag, github_token, codeberg_token, args.print_payload)
+        
+        display_tag = tag if tag is not None and tag != '' else 'latest'
+        
+        results.append({
+            "Rockon": "N/A",
+            "image": args.image,
+            "tag": display_tag,
+            "image:tag": f"{args.image}:{display_tag}",
+            "Availability": repo_info.get("available"),
+            "Last Published": repo_info.get("last_published")
+        })
+
     else:
-        print("No data extracted. Please check the directory and file contents.")
+        # Default behavior: scan JSON files
+        images_to_check = get_images_from_json(json_directory)
+        if not images_to_check:
+            print("No images to check. Exiting.")
+            return
+
+        print("\nFound the following unique image:tag combinations:")
+        for img in images_to_check:
+            print(f"- {img}")
+        print("\n")
+        
+        results = process_json_files(json_directory, github_token, codeberg_token, args.print_payload)
+
+    print_results(results, args.output_format)
+
+if __name__ == "__main__":
+    main()
