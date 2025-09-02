@@ -283,7 +283,7 @@ def process_json_files(directory, github_token, codeberg_token, print_payload):
                             "tag": display_tag,
                             "image:tag": f"{image}:{display_tag}",
                             "Availability": repo_info.get("available"),
-                            "Last Published": repo_info.get("last_published")
+                            "Last Published": repo_info.get("last_published")[:10] # truncate to yyy-mm-dd only
                         })
 
         except json.JSONDecodeError as e:
@@ -333,6 +333,10 @@ def get_images_from_json(directory):
     return sorted(list(images))
 
 def print_results(results, output_format):
+    
+    # sort by earliest last publishing/change date
+    results.sort(key=lambda x: (x["Last Published"], x["Rockon"]))
+
     """Prints the results in the specified format."""
     if output_format == 'json':
         output_data = [
