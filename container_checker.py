@@ -4,9 +4,7 @@
 import os
 import json
 import requests
-import re
 from tabulate import tabulate
-import glob
 import argparse
 
 # The default directory to search for JSON files.
@@ -29,12 +27,12 @@ def parse_image(image_str, tag_from_json=None):
     # Determine version 'tag' in case it is part of the image, if none then default to 'latest'
     if ':' in image_str:
         image_name, tag = image_str.rsplit(':', 1)
-    elif tag_from_json == '':
-        image_name = image_str
-        tag = tag_from_json
-    else:
+    elif tag_from_json is None:
         image_name = image_str
         tag = 'latest'
+    else:
+        image_name = image_str
+        tag = tag_from_json
 
     # Split remaining image_name into registry, owner, container for most flexibility across registry APIs
     parts = image_name.split("/", 1)
@@ -151,7 +149,7 @@ def check_ghcr_image(owner, image_name, tag, github_token=None, print_payload=Fa
         print(f"Warning: Could not check ghcr.io registry for '{image_name}': {e}")
         return {"available": "Unknown", "last_published": "N/A"}
 
-    return {"available": "Not Implemented", "last_published": "N/A"}
+    # return {"available": "Not Implemented", "last_published": "N/A"}
 
 def check_codeberg_image(owner, image_name, tag, codeberg_token=None, print_payload=False):
     """
@@ -198,7 +196,7 @@ def check_codeberg_image(owner, image_name, tag, codeberg_token=None, print_payl
         print(f"Warning: Could not check codeberg.org registry for '{image_name}': {e}")
         return {"available": "Unknown", "last_published": "N/A"}
 
-        return {"available": "Not Implemented", "last_published": "N/A"}
+        # return {"available": "Not Implemented", "last_published": "N/A"}
 
 def check_image_repository(image_str, tag_from_json=None, github_token=None, codeberg_token=None, print_payload=False):
     """
