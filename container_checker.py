@@ -333,11 +333,11 @@ def get_images_from_json(directory):
     return sorted(list(images))
 
 def print_results(results, output_format):
+    """Prints the results in the specified format."""    
     
     # sort by earliest last publishing/change date
     results.sort(key=lambda x: (x["Last Published"], x["Rockon"]))
 
-    """Prints the results in the specified format."""
     if output_format == 'json':
         output_data = [
             {"rockon": r['Rockon'], "image": r['image:tag'], "version": r['tag'], "status": r['Availability'], "last_published": r['Last Published']}
